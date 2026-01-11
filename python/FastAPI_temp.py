@@ -204,3 +204,293 @@ async def predict_mappings(req: PredictRequest):
                 "or 'google-generativeai'."
             ),
         )
+
+
+#-------------------------------------------------------------------------
+##---- Modulerize code
+#-------------------------------------------------------------------------
+Add __init__.py in app/, app/routers/, app/models/, and app/schemas/ 
+if you prefer traditional Python packages:
+touch app/__init__.py app/routers/__init__.py app/models/__init__.py app/schemas/__init__.py
+
+
+# app/main.py
+#---------------------------------------------------------------
+from fastapi import FastAPI
+from app.routers.etl_mappings import router as etl_router
+
+app = FastAPI(title="ETL Mappings Predictor", version="1.0.0")
+
+# Health/Root endpoint (optional)
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "ETL Mappings Predictor"}
+
+# Include the ETL router with base prefix
+app.include_router(etl_router, prefix="/etl/mappings")
+
+
+# app/routers/etl_mappings.py
+#---------------------------------------------------------------
+
+from fastapi import APIRouter, HTTPException
+from typing import List
+import json
+from pydantic import ValidationError
+
+from app.schemas.mapping import PredictRequest, MappingPrediction
+from app.models.prompt_builder import build_prompt
+from app.models.genai_client import predict_with_gemini
+from app.schemas.response_schema import mapping_json_schema_dict, mapping_schema_obj
+
+router = APIRouter(tags=["ETL Mappings"])
+
+@router.post("/predict", response_model=List[MappingPrediction])
+async def predict_mappings(req: PredictRequest):
+    # Build prompt from request
+    prompt = build_prompt(req.sourceTable, req.targetTable)
+
+    # Build both SDK-specific and generic JSON schemas
+    strict_schema_obj = mapping_schema_obj()
+    strict_schema_dict = mapping_json_schema_dict()
+
+    try:
+        # Ask Gemini for a structured JSON response
+        text = predict_with_gemini(
+            prompt=prompt,
+            response_schema_obj=strict_schema_obj,
+            temperature=0.1,
+            model_name="gemini-2.5-flash"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error predicting mappings: {str(e)}")
+
+    if not text:
+        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+
+    # Parse and validate against Pydantic models
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Invalid JSON returned by model")
+
+    try:
+        return [MappingPrediction(**item) for item in raw]
+    except ValidationError as ve:
+        raise HTTPException(status_code=502, detail=f"Response validation failed: {ve}")
+
+# app/models/genai_client.py
+#----------------------------------------------------------------------------------
+
+import os
+
+# Prefer newer google-genai SDK if available
+try:
+    from google.genai import Client
+    GENAI_SDK = "google-genai"
+except ImportError:
+    GENAI_SDK = None
+
+# Fallback to older google-generativeai library
+if GENAI_SDK is None:
+    try:
+        import google.generativeai as genai
+        GENAI_SDK = "google-generativeai"
+    except ImportError:
+        GENAI_SDK = None
+
+def predict_with_gemini(
+    prompt: str,
+    response_schema_obj=None,
+    temperature: float = 0.1,
+    model_name: str = "gemini-2.5-flash",
+) -> str:
+    """
+    Calls Gemini to generate structured JSON text based on the given prompt.
+    Returns raw text output (JSON string). Raises exceptions for any errors.
+    """
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        raise RuntimeError("API_KEY is missing from environment variables.")
+
+    if GENAI_SDK == "google-genai":
+        # Newer SDK with structured output support
+        client = Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "temperature": temperature,
+                "response_schema": response_schema_obj,  # may be None
+            },
+        )
+        # For google-genai SDK, text may be under .text or .output_text
+        return getattr(response, "text", None) or getattr(response, "output_text", None)
+
+    elif GENAI_SDK == "google-generativeai":
+        # Older SDK; schema enforcement done by our post-parse validation
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": temperature,
+            },
+        )
+        return getattr(response, "text", None)
+
+    else:
+        raise RuntimeError(
+            "No Google GenAI SDK found. Install 'google-genai' or 'google-generativeai'."
+        )
+
+# app/models/prompt_builder.py
+#--------------------------------------------------------------------------------
+
+import json
+from app.schemas.mapping import TableSchema
+
+def build_prompt(source: TableSchema, target: TableSchema) -> str:
+    return f"""
+You are an expert Data Engineer specializing in ETL (Extract, Transform, Load) processes.
+
+Your task is to map fields from a **Source Table** to a **Target Table**.
+
+### Source Table: {source.name}
+Description: {source.description or ""}
+Fields:
+{json.dumps([f.dict() for f in source.fields], ensure_ascii=False, indent=2)}
+
+### Target Table: {target.name}
+Description: {target.description or ""}
+Fields:
+{json.dumps([f.dict() for f in target.fields], ensure_ascii=False, indent=2)}
+
+### Instructions:
+1. For EACH field in the Target Table, find the best corresponding field in the Source Table.
+2. Consider field names, data types, descriptions, and sample values.
+3. If multiple source fields are needed (e.g., First Name + Last Name -> Full Name), specify the primary source field in 'sourceFieldName' and explain the combination in 'transformationSuggestion'.
+4. If no suitable match exists, set 'sourceFieldName' to null.
+5. Provide a confidence score (0-100) and brief reasoning.
+
+Return the output strictly as a JSON array adhering to the schema.
+""".strip()
+
+# app/schemas/mapping.py
+#----------------------------------------------------------------------------------
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any
+
+class FieldSchema(BaseModel):
+    name: str
+    dataType: Optional[str] = None
+    description: Optional[str] = None
+    sampleValues: Optional[List[Any]] = None
+
+class TableSchema(BaseModel):
+    name: str
+    description: Optional[str] = None
+    fields: List[FieldSchema]
+
+class MappingPrediction(BaseModel):
+    targetFieldName: str
+    sourceFieldName: Optional[str] = None  # null if no match
+    confidence: int = Field(..., ge=0, le=100)
+    reasoning: str
+    transformationSuggestion: Optional[str] = None
+
+class PredictRequest(BaseModel):
+    sourceTable: TableSchema
+    targetTable: TableSchema
+
+# app/schemas/response_schema.py
+#-----------------------------------------------------------------------------------
+
+def mapping_json_schema_dict() -> dict:
+    """Generic JSON schema dictionary for our mapping predictions."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "targetFieldName": {"type": "string"},
+                "sourceFieldName": {"type": ["string", "null"]},
+                "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                "reasoning": {"type": "string"},
+                "transformationSuggestion": {"type": ["string", "null"]},
+            },
+            "required": ["targetFieldName", "sourceFieldName", "confidence", "reasoning"],
+        },
+    }
+
+def mapping_schema_obj():
+    """
+    Builds a google-genai 'Schema' object if the SDK is available.
+    Returns None when the SDK is not present; the caller should still
+    request JSON output and validate post-parse using Pydantic.
+    """
+    try:
+        from google.genai.types import Schema, Type
+    except Exception:
+        return None
+
+    return Schema(
+        type=Type.ARRAY,
+        items=Schema(
+            type=Type.OBJECT,
+            properties={
+                "targetFieldName": Schema(type=Type.STRING),
+                "sourceFieldName": Schema(type=Type.STRING, nullable=True),
+                "confidence": Schema(type=Type.INTEGER),
+                "reasoning": Schema(type=Type.STRING),
+                "transformationSuggestion": Schema(type=Type.STRING, nullable=True),
+            },
+            required=["targetFieldName", "sourceFieldName", "confidence", "reasoning"],
+        ),
+    )
+
+# start_up.py
+#----------------------------------------------------------------------------------
+
+# From the project root (fastapi-hello-world/)
+python -m venv venv
+source venv/bin/activate     # Linux/macOS
+# .\venv\Scripts\Activate    # Windows PowerShell
+
+pip install -r requirements.txt
+
+export API_KEY="<YOUR_GOOGLE_GENAI_API_KEY>"  # macOS/Linux
+# set API_KEY=<YOUR_GOOGLE_GENAI_API_KEY>     # Windows
+
+uvicorn app.main:app --reload --port 8000
+
+# API Test
+#--------------------------------------------------------------------------
+
+curl -X POST "http://localhost:8000/etl/mappings/predict" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceTable": {
+      "name": "crm_users",
+      "description": "CRM export of user details",
+      "fields": [
+        {"name": "first_name", "dataType": "string"},
+        {"name": "last_name", "dataType": "string"},
+        {"name": "email", "dataType": "string"},
+        {"name": "dob", "dataType": "date"}
+      ]
+    },
+    "targetTable": {
+      "name": "warehouse_customers",
+      "description": "Normalized customer dimension",
+      "fields": [
+        {"name": "full_name", "dataType": "string"},
+        {"name": "email_address", "dataType": "string"},
+        {"name": "birth_date", "dataType": "date"}
+      ]
+    }
+  }'
+
