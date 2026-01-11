@@ -229,6 +229,7 @@ def root():
 # Include the ETL router with base prefix
 app.include_router(etl_router, prefix="/etl/mappings")
 
+app.include_router(script_router, prefix="/etl/scripts")
 
 # app/routers/etl_mappings.py
 #---------------------------------------------------------------
@@ -278,6 +279,46 @@ async def predict_mappings(req: PredictRequest):
         return [MappingPrediction(**item) for item in raw]
     except ValidationError as ve:
         raise HTTPException(status_code=502, detail=f"Response validation failed: {ve}")
+
+# app/routers/etl_scripts.py
+#---------------------------------------------------------------
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import PlainTextResponse
+
+from app.schemas.script import GenerateScriptRequest
+from app.models.etl_prompt_builder import build_script_prompt
+from app.models.genai_client import generate_text_with_gemini
+
+router = APIRouter(tags=["ETL Scripts"])
+
+@router.post("/generate", response_class=PlainTextResponse)
+async def generate_etl_script(req: GenerateScriptRequest):
+    """
+    Returns ONLY the generated script as text (no JSON wrapper).
+    """
+    prompt = build_script_prompt(
+        source=req.sourceTable,
+        target=req.targetTable,
+        mappings=req.mappings,
+        dialect=req.dialect
+    )
+
+    try:
+        text = generate_text_with_gemini(
+            prompt=prompt,
+            model_name="gemini-2.5-flash",
+            temperature=0.2,
+            response_mime_type="text/plain"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating script: {str(e)}")
+
+    if not text:
+        # Mirrors your original fallback
+        return "-- No script generated."
+
+    return text
 
 # app/models/genai_client.py
 #----------------------------------------------------------------------------------
@@ -346,6 +387,48 @@ def predict_with_gemini(
             "No Google GenAI SDK found. Install 'google-genai' or 'google-generativeai'."
         )
 
+
+def generate_text_with_gemini(
+    prompt: str,
+    model_name: str = "gemini-2.5-flash",
+    temperature: float = 0.2,
+    response_mime_type: str = "text/plain"
+) -> str:
+    """
+    Generates plain text (e.g., SQL script) with Gemini.
+    Returns raw text output. Raises exceptions for any errors.
+    """
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        raise RuntimeError("API_KEY is missing from environment variables.")
+
+    if GENAI_SDK == "google-genai":
+        client = Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={
+                "response_mime_type": response_mime_type,
+                "temperature": temperature,
+            },
+        )
+        return getattr(response, "text", None) or getattr(response, "output_text", None)
+
+    elif GENAI_SDK == "google-generativeai":
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "response_mime_type": response_mime_type,
+                "temperature": temperature,
+            },
+        )
+        return getattr(response, "text", None)
+
+    else:
+        raise RuntimeError("No Google GenAI SDK found. Install 'google-genai' or 'google-generativeai'.")
+``
 # app/models/prompt_builder.py
 #--------------------------------------------------------------------------------
 
@@ -376,6 +459,46 @@ Fields:
 5. Provide a confidence score (0-100) and brief reasoning.
 
 Return the output strictly as a JSON array adhering to the schema.
+""".strip()
+
+# app/models/prompt_builder.py
+#--------------------------------------------------------------------------------
+
+import json
+from typing import List
+from app.schemas.mapping import TableSchema, MappingPrediction
+
+def build_script_prompt(
+    source: TableSchema,
+    target: TableSchema,
+    mappings: List[MappingPrediction],
+    dialect: str
+) -> str:
+    """
+    Builds a prompt that instructs Gemini to produce a production-grade ETL script
+    for the specified SQL dialect, returning ONLY the code (no fences).
+    """
+    mapping_json = json.dumps([m.dict() for m in mappings], ensure_ascii=False, indent=2)
+
+    return f"""
+Act as a Senior Data Engineer.
+Generate a production-grade ETL script to load data from the Source Table to the Target Table.
+
+### Context
+Dialect: {dialect}
+Source Table: {source.name}
+Target Table: {target.name}
+
+### Schema Mapping
+{mapping_json}
+
+### Requirements
+1. Write a complete, valid script for the specified dialect ({dialect}).
+2. Use a MERGE statement (upsert) or INSERT SELECT statement as appropriate for the dialect.
+3. If 'sourceFieldName' is null in the mapping, handle it gracefully (e.g., insert NULL or a default value).
+4. Apply any logic found in 'transformationSuggestion' from the mapping.
+5. Include helpful comments explaining the logic.
+6. Return ONLY the code. Do not wrap it in markdown code blocks.
 """.strip()
 
 # app/schemas/mapping.py
@@ -452,6 +575,18 @@ def mapping_schema_obj():
         ),
     )
 
+#app/schemas/script.py
+#----------------------------------------------------------------------------------
+from pydantic import BaseModel
+from typing import List
+from app.schemas.mapping import TableSchema, MappingPrediction
+
+class GenerateScriptRequest(BaseModel):
+    sourceTable: TableSchema
+    targetTable: TableSchema
+    mappings: List[MappingPrediction]
+    dialect: str   # e.g., 'postgres', 'snowflake', 'bigquery', 'sqlserver', 'mysql'
+
 # start_up.py
 #----------------------------------------------------------------------------------
 
@@ -494,3 +629,52 @@ curl -X POST "http://localhost:8000/etl/mappings/predict" \
     }
   }'
 
+
+curl -X POST "http://localhost:8000/etl/scripts/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceTable": {
+      "name": "crm_users",
+      "description": "CRM export of user details",
+      "fields": [
+        {"name": "first_name", "dataType": "string"},
+        {"name": "last_name", "dataType": "string"},
+        {"name": "email", "dataType": "string"},
+        {"name": "dob", "dataType": "date"}
+      ]
+    },
+    "targetTable": {
+      "name": "warehouse_customers",
+      "description": "Normalized customer dimension",
+      "fields": [
+        {"name": "customer_name", "dataType": "string"},
+        {"name": "email_address", "dataType": "string"},
+        {"name": "birth_date", "dataType": "date"}
+      ]
+    },
+    "mappings": [
+      {
+        "targetFieldName": "customer_name",
+        "sourceFieldName": "first_name",
+        "confidence": 92,
+        "reasoning": "Combine first and last for full name",
+        "transformationSuggestion": "CONCAT(first_name, ' ', last_name)"
+      },
+      {
+        "targetFieldName": "email_address",
+        "sourceFieldName": "email",
+        "confidence": 98,
+        "reasoning": "Exact match",
+        "transformationSuggestion": null
+      },
+      {
+        "targetFieldName": "birth_date",
+        "sourceFieldName": "dob",
+        "confidence": 95,
+        "reasoning": "Alias mapping",
+        "transformationSuggestion": null
+      }
+    ],
+    "dialect": "postgres"
+  }'
+``
