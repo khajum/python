@@ -53,4 +53,28 @@ Virtual environments are a best practice for:
 ```bash
 python -m venv venv
  ```
+### 2. Activate the Environment
+
+**Windows (PowerShell)**
+```bash
+.\venv\Scripts\activate
+```
+### 3. Install Dependencies
+```bash
+pip install fastapi uvicorn
+
+```
+Packages are installed <strong>only inside the virtual environment.</strong>
+
+### 4. Freeze Dependencies
+```bash
+pip freeze > requirements.txt
+```
+
+Used to reproduce the same environment across machines and pipelines.
+
+### 5. Deactivate the Environment
+```bash
+deactivate
+```
 </details>
