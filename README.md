@@ -52,5 +52,5 @@ Virtual environments are a best practice for:
 #### 1. Create a Virtual Environment
 ```bash
 python -m venv venv
-
+ ```
 </details>
